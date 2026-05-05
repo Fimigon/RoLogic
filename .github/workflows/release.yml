@@ -1,0 +1,71 @@
+name: Build update manifests
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate config.json and Tauri update feed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRIDGE_KEY: ${{ secrets.BRIDGE_KEY }}
+          SERVER_URL: ${{ secrets.SERVER_URL }}
+          MIN_VERSION: ${{ vars.MIN_VERSION }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SERVER_URL:-}" ] || [ -z "${BRIDGE_KEY:-}" ]; then
+            echo "::error::SERVER_URL and BRIDGE_KEY must be set as repo secrets"
+            exit 1
+          fi
+
+          MIN_VER="${MIN_VERSION:-1.0.0}"
+          VERSION="${TAG#v}"
+
+          gh release view "$TAG" --repo "$REPO" --json assets,publishedAt,body > release.json
+
+          INSTALLER_NAME=$(jq -r '.assets[].name | select(endswith("_x64-setup.nsis.zip"))' release.json | head -n1)
+          SIG_NAME=$(jq -r '.assets[].name | select(endswith("_x64-setup.nsis.zip.sig"))' release.json | head -n1)
+
+          if [ -z "$INSTALLER_NAME" ]; then
+            echo "::error::No installer (.nsis.zip) attached to release $TAG. Run 'tauri build' and upload the installer."
+            exit 1
+          fi
+          if [ -z "$SIG_NAME" ]; then
+            echo "::error::No signature (.nsis.zip.sig) attached to release $TAG. Upload it next to the installer — Tauri's auto-updater needs it."
+            exit 1
+          fi
+
+          gh release download "$TAG" --repo "$REPO" --pattern "$SIG_NAME" --dir .
+          SIGNATURE=$(cat "$SIG_NAME")
+
+          PUB_DATE=$(jq -r '.publishedAt' release.json)
+          BODY=$(jq -r '.body // ""' release.json)
+          INSTALLER_URL="https://github.com/$REPO/releases/download/$TAG/$INSTALLER_NAME"
+
+          jq -n \
+            --arg server_url "$SERVER_URL" \
+            --arg bridge_key "$BRIDGE_KEY" \
+            --arg min_version "$MIN_VER" \
+            --arg changelog "$BODY" \
+            '{server_url: $server_url, bridge_key: $bridge_key, min_version: $min_version, changelog: $changelog}' \
+            > config.json
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$BODY" \
+            --arg pub_date "$PUB_DATE" \
+            --arg sig "$SIGNATURE" \
+            --arg url "$INSTALLER_URL" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: {"windows-x86_64": {signature: $sig, url: $url}}}' \
+            > update-windows-x86_64.json
+
+          gh release upload "$TAG" config.json update-windows-x86_64.json --repo "$REPO" --clobber
